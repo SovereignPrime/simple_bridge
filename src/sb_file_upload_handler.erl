@@ -192,7 +192,7 @@ handle_complete_file(State) -> State.
 get_tempfilename() ->
     Dir = case init:get_argument(simple_bridge_scratch_dir) of
               {ok, [[Value]]} -> Value;
-              _ -> ?SCRATCH_DIR
+              _ -> application:get_env(simple_bridge, scratch_dir, ?SCRATCH_DIR)
           end,
     Parts = [integer_to_list(X) || X <- binary_to_list(erlang:md5(term_to_binary(erlang:now())))],
     filename:join([Dir, string:join(Parts, "-")]).
