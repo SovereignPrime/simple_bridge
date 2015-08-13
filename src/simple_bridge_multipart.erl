@@ -1,9 +1,10 @@
+% vim: ts=4 sw=4 et
 % Simple Bridge
 % Copyright (c) 2008-2010 Rusty Klophaus
 % See MIT-LICENSE for licensing information.
 
 -module (simple_bridge_multipart).
--include_lib ("simple_bridge.hrl").
+-include("simple_bridge.hrl").
 -export ([parse/1]).
 
 % Alas, so many Erlang HTTP Servers, and so little parsing of Multipart forms.
@@ -12,12 +13,10 @@
 % Large portions of this file are from mochiweb_multipart.erl
 % Copyright 2007 Mochi Media, Inc., written by Bob Ippolito <bob@mochimedia.com>.
 
-% Replace with http://bitbucket.org/justin/webmachine/src/tip/src/webmachine_multipart.erl
-
 -define(CHUNKSIZE, 8 * 1024).
 -define(IDLE_TIMEOUT, 30000).
 
-% Override with -simple_bridge_max_post_size SizeInMB
+% Override with simple_bridge configuration {max_post_size, SizeInMB}
 -define (MAX_POST_SIZE, 100).
 
 -record (state, {
@@ -46,47 +45,75 @@ parse(Req) ->
     end.
 
 is_multipart_request(Req) ->
-    try Req:header(content_type) of
-        "multipart/form-data" ++ _ -> true;
-        _                          -> false
-    catch _:_                      -> false
+    try sbw:header_lower(content_type, Req) of
+        "multipart/form-data" ++ _  -> true;
+        _                           -> false
+    catch _:_                       -> false
     end.
 
 parse_multipart(Req) ->
     try
-        % Get the boundary...
-        {_K, _V, Props} = parse_header(Req:header(content_type)),
-        Length = list_to_integer(Req:header(content_length)),
-        Boundary = to_binary(proplists:get_value("boundary", Props)),
-
-        % Throw exception if the post is getting too big.
-        case Length > get_max_post_size() of
-            true  -> throw(post_too_big);
-            false -> continue
-        end,
-
-        % Get whatever the underlying server has already read...
-        Data = to_binary(Req:request_body()),
-
-        % Create the state...
-        State = #state { req = Req, boundary = Boundary, length=Length, bytes_read = size(Data), parts = [] },
+        Boundary = get_multipart_boundary(Req),
+        Length = get_content_length(Req),
+        ok = crash_if_too_big(Length),
+        Data = get_opening_body(Req), 
+        State = init_state(Req, Boundary, Length, Data),
         State1 = read_boundary(Data, State),
-        % Respond with {ok, Params, Files}.
-        {
-            ok,
-            [{Name, Value} || #part { name=Name, value=Value, filename=undefined } <- State1#state.parts],
-            [#sb_uploaded_file {
-                original_name=Filename,
-                temp_file=sb_file_upload_handler:get_tempfile(FileUploadHandler),
-                data=sb_file_upload_handler:get_data(FileUploadHandler),
-                size=Size,
-                field_name=Name
-            } || #part { filename=Filename, value={file, FileUploadHandler}, size=Size, name=Name } <- State1#state.parts]
-        }
+        {Params, Files} = process_parts(State1#state.parts),
+        {ok, Params, Files}
     catch
         throw : post_too_big -> {error, post_too_big};
         throw : {file_too_big, FileName} -> {error, {file_too_big, FileName}}
     end.
+
+get_content_length(Req) ->
+    to_integer(sbw:header(content_length, Req)).
+
+get_opening_body(Req) ->
+    simple_bridge_util:to_binary(sbw:request_body(Req)).
+
+
+get_multipart_boundary(Req) ->
+    {_K, _V, Props} = parse_header(sbw:header(content_type, Req)),
+    Boundary = proplists:get_value("boundary", Props),
+    simple_bridge_util:to_binary(Boundary).
+
+
+init_state(Req, Boundary, Length, Data) ->
+    #state{
+        req = Req,
+        boundary = Boundary,
+        length=Length,
+        bytes_read = size(Data),
+        parts = []
+    }.
+
+crash_if_too_big(Length) ->
+    case Length > get_max_post_size() of
+        true  -> throw(post_too_big);
+        false -> ok
+    end.
+
+process_parts(Parts) ->
+    Params = convert_parts_to_params(Parts),
+    Files = convert_parts_to_files(Parts),
+    {Params, Files}.
+
+convert_parts_to_params(Parts) ->
+    [
+        {simple_bridge_util:to_binary(Name),
+         simple_bridge_util:to_binary(Value)
+        } || #part { name=Name, value=Value, filename=undefined } <- Parts
+    ].
+
+convert_parts_to_files(Parts) ->
+    [#sb_uploaded_file {
+        original_name=Filename,
+        temp_file=sb_file_upload_handler:get_tempfile(FileUploadHandler),
+        data=sb_file_upload_handler:get_data(FileUploadHandler),
+        size=Size,
+        field_name=Name
+    } || #part { filename=Filename, value={file, FileUploadHandler}, size=Size, name=Name } <- Parts].
 
 % Not yet in a part. Read the POST headers to get content boundary and length.
 read_boundary(Data, State = #state { boundary=Boundary }) ->
@@ -137,7 +164,7 @@ read_part_value(Data, Part, State = #state { boundary=Boundary }) ->
             State2 = update_state_with_part(Part1, State1),
             read_part_header(Data1, #part {}, State2);
         A when A == start_value orelse A == continue ->
-            % Write the line, then continue...	
+            % Write the line, then continue...  
             Part2 = update_part_with_value(Line, true, Part1),
             read_part_value(Data1, Part2, State1);
         eof ->
@@ -173,7 +200,7 @@ get_prefix_and_newsize(NeedsRN, Size, Data) ->
 % Return the next line of input from the post, reading
 % more data if necessary.
 % get_next_line(Data, State) -> {Line, RemainingData, NewState}.
-get_next_line(Data, Part, State)	-> get_next_line(Data, <<>>, Part, State).
+get_next_line(Data, Part, State)    -> get_next_line(Data, <<>>, Part, State).
 get_next_line(<<?NEWLINE, Data/binary>>, Acc, Part, State) -> {<<Acc/binary>>, Data, Part, State};
 get_next_line(<<C, Data/binary>>, Acc, Part, State) -> get_next_line(Data, <<Acc/binary, C>>, Part, State);
 get_next_line(Data, Acc, Part, State) when Data == undefined orelse Data == <<>> ->
@@ -190,15 +217,9 @@ get_next_line(Data, Acc, Part, State) when Data == undefined orelse Data == <<>>
 
 read_chunk(State = #state { req=Req, length=Length, bytes_read=BytesRead }) ->
     BytesToRead = lists:min([Length - BytesRead, ?CHUNKSIZE]),
-    Data = Req:recv_from_socket(BytesToRead, ?IDLE_TIMEOUT),
+    Data = sbw:recv_from_socket(BytesToRead, ?IDLE_TIMEOUT, Req),
     NewBytesRead = BytesRead + size(Data),
-
-    % Throw exception if the post is getting too big...
-    case NewBytesRead > get_max_post_size() of
-        true -> throw(post_too_big);
-        false -> continue
-    end,
-
+    ok=crash_if_too_big(NewBytesRead),
     {Data, State#state { bytes_read=NewBytesRead }}.
 
 interpret_line(Line, Boundary) ->
@@ -228,11 +249,7 @@ parse_keyvalue(Char, S) ->
         unquote_header(string:strip(Value))}.
 
 get_max_post_size() ->
-    Size = case init:get_argument(simple_bridge_max_post_size) of
-               {ok, [[Value]]} -> list_to_integer(Value);
-               _ -> ?MAX_POST_SIZE
-           end,
-    Size * 1024 * 1024.
+    simple_bridge_util:get_max_post_size(?MAX_POST_SIZE).
 
 
 % unquote_header borrowed from Mochiweb.
@@ -243,8 +260,6 @@ unquote_header("\"", Acc) -> lists:reverse(Acc);
 unquote_header([$\\, C | Rest], Acc) -> unquote_header(Rest, [C | Acc]);
 unquote_header([C | Rest], Acc) -> unquote_header(Rest, [C | Acc]).
 
-to_binary(undefined) -> <<"">>;
-to_binary(A) when is_atom(A) -> to_binary(atom_to_list(A));
-to_binary(B) when is_binary(B) -> B;
-to_binary(I) when is_integer(I) -> to_binary(integer_to_list(I));
-to_binary(L) when is_list(L) -> list_to_binary(L).
+to_integer(L) when is_list(L) -> list_to_integer(L);
+to_integer(B) when is_binary(B) -> to_integer(binary_to_list(B));
+to_integer(I) when is_integer(I) -> I.

@@ -6,3 +6,9 @@ erl_crash.dump
 /deps/*
 test/logs/*
 logs
+crypto_compat.hrl
+log/
+test/app.config
+logs/
+rebar.test.*.config
+.deps_plt
